@@ -1,54 +1,61 @@
 #![allow(non_snake_case)]
-use ark_std::{end_timer, start_timer};
-use halo2_base::halo2_proofs::halo2curves::group::GroupEncoding;
-use halo2_base::halo2_proofs::halo2curves::serde::SerdeObject;
-use halo2_base::halo2_proofs::plonk::{VerifyingKey, verify_proof};
-use halo2_base::halo2_proofs::poly::kzg::multiopen::{ProverGWC, VerifierGWC};
-use halo2_base::{utils::PrimeField, SKIP_FIRST_PASS};
+use halo2_base::SKIP_FIRST_PASS;
+use halo2_ecc::fields::PrimeField;
 use serde::{Deserialize, Serialize};
-use snark_verifier::loader::evm::{EvmLoader, self, encode_calldata, ExecutorBuilder};
-use snark_verifier::pcs::kzg::{KzgAs, Gwc19, KzgDecidingKey};
-use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
-use snark_verifier::system::halo2::{compile, Config};
-use snark_verifier::verifier::{self, SnarkVerifier};
-use std::error;
-// use snark_verifier::verifier::plonk::PlonkVerifier;
 use std::fs::File;
-use std::io::BufReader;
 use std::marker::PhantomData;
+
+use halo2_base::halo2_proofs::{
+    arithmetic::CurveAffine,
+    halo2curves::bn256::{Bn256, Fq as bn256Fq, Fr, G1Affine},
+    halo2curves::secp256r1::{Fp, Fq, Secp256r1Affine},
+    plonk::*,
+    poly::{
+        commitment::ParamsProver,
+        kzg::multiopen::{ProverGWC, VerifierGWC},
+        kzg::{
+            commitment::KZGCommitmentScheme,
+            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            strategy::SingleStrategy,
+        },
+    },
+    transcript::{Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer},
+};
+use rand_core::OsRng;
+
+use snark_verifier::system::halo2::{compile, Config};
+use snark_verifier::verifier;
+use snark_verifier::verifier::PlonkVerifier;
+use snark_verifier::{
+    loader::evm::{self, encode_calldata, EvmLoader, ExecutorBuilder},
+    pcs::kzg::{Bdfg21, Kzg},
+};
+use snark_verifier::{system::halo2::transcript::evm::EvmTranscript, util::transcript::Transcript};
+use std::io::BufReader;
 use std::rc::Rc;
 use std::{env::var, io::Write};
 
 use halo2_base::halo2_proofs::{
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     SerdeFormat,
-    arithmetic::CurveAffine,
-    circuit::{Value, Layouter, SimpleFloorPlanner},
-    dev::MockProver,
-    halo2curves::bn256::{Bn256, Fr, Fq as bn256Fq, G1Affine},
-    halo2curves::secp256r1::{Fp, Fq, Secp256r1Affine},
-    plonk::{Circuit, ConstraintSystem, create_proof, Error, ProvingKey, keygen_pk, keygen_vk},
-    poly::commitment::ParamsProver,
-    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
-use halo2_base::halo2_proofs::{
-    poly::kzg::{
-        commitment::KZGCommitmentScheme,
-        multiopen::{ProverSHPLONK, VerifierSHPLONK},
-        strategy::SingleStrategy,
-    },
-    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-};
-use std::{env::set_var, fs, io::BufRead};
-use rand_core::OsRng;
+// use std::{env::set_var, fs, io::BufRead};
 
+use halo2_base::utils::fs::gen_srs;
+use halo2_base::utils::modulus;
 use halo2_ecc::{
     ecc::{ecdsa::ecdsa_verify_no_pubkey_check, EccChip},
-    fields::{fp::{FpStrategy, FpConfig}, FieldChip},
+    fields::{
+        fp::{FpConfig, FpStrategy},
+        FieldChip,
+    },
 };
-use halo2_base::utils::{biguint_to_fe, fe_to_biguint, modulus};
-use halo2_base::utils::fs::gen_srs;
+
+use ethereum_types::Address;
 
 type FpChip<F> = FpConfig<F, Fp>;
+
+type Plonk = verifier::Plonk<Kzg<Bn256, Bdfg21>>;
 
 #[derive(Serialize, Deserialize)]
 struct CircuitParams {
@@ -92,8 +99,8 @@ impl<F: PrimeField> Circuit<F> for ECDSACircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let path = var("ECDSA_CONFIG")
-            .unwrap_or_else(|_| "./src/configs/ecdsa_circuit.config".to_string());
+        let path =
+            var("ECDSA_CONFIG").unwrap_or_else(|_| "src/configs/ecdsa_circuit.config".to_string());
         let params: CircuitParams = serde_json::from_reader(
             File::open(&path).unwrap_or_else(|_| panic!("{path:?} file should exist")),
         )
@@ -179,7 +186,7 @@ impl<F: PrimeField> Circuit<F> for ECDSACircuit<F> {
                     ),
                 );
                 // test ECDSA
-                let ecdsa = ecdsa_verify_no_pubkey_check::<F, Fp, Fq, Secp256r1Affine>(
+                let _ecdsa = ecdsa_verify_no_pubkey_check::<F, Fp, Fq, Secp256r1Affine>(
                     &ecc_chip.field_chip,
                     ctx,
                     &pk_assigned,
@@ -196,7 +203,7 @@ impl<F: PrimeField> Circuit<F> for ECDSACircuit<F> {
 
                 #[cfg(feature = "display")]
                 if self.r.is_some() {
-                    println!("ECDSA res {ecdsa:?}");
+                    println!("ECDSA res {_ecdsa:?}");
 
                     ctx.print_stats(&["Range"]);
                 }
@@ -209,10 +216,13 @@ impl<F: PrimeField> Circuit<F> for ECDSACircuit<F> {
 #[cfg(test)]
 #[test]
 fn test_secp256r1_ecdsa() {
+    use halo2_base::halo2_proofs::arithmetic::Field;
+    use halo2_base::halo2_proofs::dev::MockProver;
+    use halo2_base::utils::{biguint_to_fe, fe_to_biguint};
+
     let mut folder = std::path::PathBuf::new();
     folder.push("./src");
-    folder.push("./configs/ecdsa_circuit.config");
-    println!("{:?}", folder.as_path().display());
+    folder.push("configs/ecdsa_circuit.config");
     let params_str = std::fs::read_to_string(folder.as_path())
         .expect("src/configs/ecdsa_circuit.config file should exist");
     let params: CircuitParams = serde_json::from_str(params_str.as_str()).unwrap();
@@ -253,7 +263,11 @@ fn test_secp256r1_ecdsa() {
 //     Ok((pk, vk))
 // }
 
-pub fn download_keys(degree: u32, proving_key_path: Option<&str>, verifying_key_path: Option<&str>) -> Result<(), Error> {
+pub fn download_keys(
+    degree: u32,
+    proving_key_path: Option<&str>,
+    verifying_key_path: Option<&str>,
+) -> Result<(), Error> {
     let circuit = ECDSACircuit::<Fr>::default();
     let params = gen_srs(degree);
     let vk = keygen_vk(&params, &circuit)?;
@@ -271,12 +285,46 @@ pub fn download_keys(degree: u32, proving_key_path: Option<&str>, verifying_key_
     Ok(())
 }
 
+// fn gen_evm_verifier(
+//     params: &ParamsKZG<Bn256>,
+//     vk: &VerifyingKey<G1Affine>,
+//     num_instance: Vec<usize>,
+// ) -> Vec<u8> {
+//     let svk = params.get_g()[0].into();
+//     let dk = (params.g2(), params.s_g2()).into();
+//     let protocol = compile(params, vk, Config::kzg().with_num_instance(num_instance.clone()));
 
-pub fn generate_verifier(verifying_key_path: &str, degree: u32, valid_proof_hex: &Option<String>) -> Result<(Vec<u8>, String), Error> {
-    type PlonkVerifier = verifier::plonk::PlonkVerifier<KzgAs<Bn256, Gwc19>>;
+//     let loader = EvmLoader::new::<Fq, Fr>();
+//     let protocol = protocol.loaded(&loader);
+
+//     let mut transcript = EvmTranscript::<_, Rc<EvmLoader>, _, _>::new(&loader);
+
+//     let instances = transcript.load_instances(num_instance);
+
+//     let proof: PlonkProof<G1Affine, Rc<EvmLoader>, _> = Plonk::read_proof(&svk, &protocol, &instances, &mut transcript);
+
+//     // println!("svk: {:?}", svk);
+//     // println!("dk: {:?}", svk);
+//     // println!("protocol {:?}", protocol);
+//     // println!("instances: {:?}", instances);
+//     // println!("proof {:?}", proof);
+
+//     Plonk::verify(&svk, &dk, &protocol, &instances, &proof);
+
+//     evm::compile_yul(&loader.yul_code())
+// }
+
+pub fn generate_verifier(
+    verifying_key_path: &str,
+    degree: u32,
+    valid_proof_hex: &Option<String>,
+) -> Result<(Vec<u8>, String), Error> {
+    // type PlonkVerifier = verifier::PlonkVerifier<KzgAs<Bn256, Gwc19>>;
     let num_instance = vec![];
 
     let params = gen_srs(degree);
+    let svk = params.get_g()[0].into();
+    let dk = (params.g2(), params.s_g2()).into();
     let vk = {
         let f = File::open(verifying_key_path).expect("Unable to open verifying key file");
         let mut reader = BufReader::new(f);
@@ -285,18 +333,17 @@ pub fn generate_verifier(verifying_key_path: &str, degree: u32, valid_proof_hex:
     let protocol = compile(
         &params,
         &vk,
-        Config::kzg().with_num_instance(num_instance.clone())
+        Config::kzg().with_num_instance(num_instance.clone()),
     );
-    let vk_kzg: KzgDecidingKey<Bn256> = (params.get_g()[0], params.g2(), params.s_g2()).into();
-
+    // let vk_kzg: KzgDecidingKey<Bn256> = KzgDecidingKey::new(params.g2(), params.s_g2());//(params.get_g()[0], params.g2(), params.s_g2());
 
     let loader = EvmLoader::new::<bn256Fq, Fr>();
     let protocol = protocol.loaded(&loader);
     let mut transcript = EvmTranscript::<_, Rc<EvmLoader>, _, _>::new(&loader);
-    
+
     let instances = transcript.load_instances(num_instance);
-    let proof = PlonkVerifier::read_proof(&vk_kzg, &protocol, &instances, &mut transcript).unwrap();
-    PlonkVerifier::verify(&vk_kzg, &protocol, &instances, &proof).unwrap();
+    let proof = Plonk::read_proof(&svk, &protocol, &instances, &mut transcript);
+    Plonk::verify(&svk, &dk, &protocol, &instances, &proof);
 
     let yul_code = &loader.yul_code();
 
@@ -307,13 +354,13 @@ pub fn generate_verifier(verifying_key_path: &str, degree: u32, valid_proof_hex:
             let mut evm = ExecutorBuilder::default()
                 .with_gas_limit(u64::MAX.into())
                 .build();
-
-            let caller = evm::Address::from_low_u64_be(0xfe);
+            let caller = Address::zero();
             let verifier = evm
                 .deploy(caller, evm::compile_yul(yul_code).into(), 0.into())
                 .address
                 .unwrap();
             let result = evm.call_raw(caller, verifier, calldata.into(), 0.into());
+            println!("result: {:?}", result);
 
             dbg!(result.gas_used);
             println!("gas: {}", result.gas_used);
@@ -326,15 +373,16 @@ pub fn generate_verifier(verifying_key_path: &str, degree: u32, valid_proof_hex:
     Ok((evm::compile_yul(yul_code), yul_code.clone()))
 }
 
-pub fn generate_proof_evm(pubkey_x: &[u8; 32], pubkey_y: &[u8; 32], r: &[u8; 32], s: &[u8; 32], msg_hash: &[u8; 32], proving_key_path: &str, degree: u32) -> Result<Vec<u8>, Error> {
-    use halo2_base::halo2_proofs::{
-        poly::kzg::{
-            commitment::KZGCommitmentScheme,
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
-            strategy::SingleStrategy,
-        },
-        transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-    };
+pub fn generate_proof_evm(
+    pubkey_x: &[u8; 32],
+    pubkey_y: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    msg_hash: &[u8; 32],
+    proving_key_path: &str,
+    degree: u32,
+) -> Result<Vec<u8>, Error> {
+    use halo2_base::halo2_proofs::transcript::TranscriptWriterBuffer;
     let params = gen_srs(degree);
     let proving_key = {
         let f = File::open(proving_key_path).expect("Unable to open proving key file");
@@ -369,22 +417,30 @@ pub fn generate_proof_evm(pubkey_x: &[u8; 32], pubkey_y: &[u8; 32], r: &[u8; 32]
         _,
         _,
         EvmTranscript<G1Affine, _, _, _>,
-        _
-    >(&params, &proving_key, &[proof_circuit], &[&[]], &mut rng, &mut transcript)?;
+        _,
+    >(
+        &params,
+        &proving_key,
+        &[proof_circuit],
+        &[&[]],
+        &mut rng,
+        &mut transcript,
+    )?;
 
     let proof = transcript.finalize();
-    Ok (proof)
+    Ok(proof)
 }
 
-pub fn generate_proof(pubkey_x: &[u8; 32], pubkey_y: &[u8; 32], r: &[u8; 32], s: &[u8; 32], msg_hash: &[u8; 32], proving_key_path: &str, degree: u32) -> Result<Vec<u8>, Error> {
-    use halo2_base::halo2_proofs::{
-        poly::kzg::{
-            commitment::KZGCommitmentScheme,
-            multiopen::{ProverSHPLONK, VerifierSHPLONK},
-            strategy::SingleStrategy,
-        },
-        transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-    };
+pub fn generate_proof(
+    pubkey_x: &[u8; 32],
+    pubkey_y: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    msg_hash: &[u8; 32],
+    proving_key_path: &str,
+    degree: u32,
+) -> Result<Vec<u8>, Error> {
+    use halo2_base::halo2_proofs::transcript::TranscriptWriterBuffer;
     let params = gen_srs(degree);
     let proving_key = {
         let f = File::open(proving_key_path).expect("Unable to open proving key file");
@@ -420,13 +476,24 @@ pub fn generate_proof(pubkey_x: &[u8; 32], pubkey_y: &[u8; 32], r: &[u8; 32], s:
         _,
         Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
         ECDSACircuit<Fr>,
-    >(&params, &proving_key, &[proof_circuit], &[&[]], &mut rng, &mut transcript)?;
+    >(
+        &params,
+        &proving_key,
+        &[proof_circuit],
+        &[&[]],
+        &mut rng,
+        &mut transcript,
+    )?;
 
     let proof = transcript.finalize();
-    Ok (proof)
+    Ok(proof)
 }
 
-pub fn verify(degree: u32, proof: Vec<u8>, verifying_key_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn verify(
+    degree: u32,
+    proof: Vec<u8>,
+    verifying_key_path: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let params = gen_srs(degree);
     let vk = {
         let f = File::open(verifying_key_path).expect("Unable to open verifying key file");
@@ -437,16 +504,20 @@ pub fn verify(degree: u32, proof: Vec<u8>, verifying_key_path: &str) -> Result<b
     let strategy = SingleStrategy::new(&params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
     let verify_result = verify_proof::<
-            KZGCommitmentScheme<Bn256>,
-            VerifierSHPLONK<'_, Bn256>,
-            Challenge255<G1Affine>,
-            Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
-            SingleStrategy<'_, Bn256>,
-        >(verifier_params, &vk, strategy, &[&[]], &mut transcript);
+        KZGCommitmentScheme<Bn256>,
+        VerifierSHPLONK<'_, Bn256>,
+        Challenge255<G1Affine>,
+        Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+        SingleStrategy<'_, Bn256>,
+    >(verifier_params, &vk, strategy, &[&[]], &mut transcript);
     Ok(verify_result.is_ok())
 }
 
-pub fn verify_evm(degree: u32, proof: Vec<u8>, verifying_key_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn verify_evm(
+    degree: u32,
+    proof: Vec<u8>,
+    verifying_key_path: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let params = gen_srs(degree);
     let vk = {
         let f = File::open(verifying_key_path).expect("Unable to open verifying key file");
@@ -459,19 +530,24 @@ pub fn verify_evm(degree: u32, proof: Vec<u8>, verifying_key_path: &str) -> Resu
 
     let mut transcript = TranscriptReadBuffer::init(&proof[..]);
     let verify_result = verify_proof::<
-            KZGCommitmentScheme<Bn256>,
-            VerifierGWC<'_, Bn256>,
-            _,
-            EvmTranscript<G1Affine, _, _, _>,
-            SingleStrategy<'_, Bn256>,
-        >(verifier_params, &vk, strategy, &[&[]], &mut transcript);
+        KZGCommitmentScheme<Bn256>,
+        VerifierGWC<'_, Bn256>,
+        _,
+        EvmTranscript<G1Affine, _, _, _>,
+        SingleStrategy<'_, Bn256>,
+    >(verifier_params, &vk, strategy, &[&[]], &mut transcript);
     Ok(verify_result.is_ok())
 }
 
 #[cfg(test)]
 #[test]
 fn bench_secp256r1_ecdsa() -> Result<(), Box<dyn std::error::Error>> {
+    use ark_std::{end_timer, start_timer};
+    use halo2_base::halo2_proofs::arithmetic::Field;
+    use halo2_base::halo2_proofs::transcript::{TranscriptReadBuffer, TranscriptWriterBuffer};
     use halo2_base::utils::fs::gen_srs;
+    use halo2_base::utils::{biguint_to_fe, fe_to_biguint};
+    use std::{env::set_var, fs, io::BufRead};
 
     let _rng = OsRng;
 
@@ -559,7 +635,14 @@ fn bench_secp256r1_ecdsa() -> Result<(), Box<dyn std::error::Error>> {
             _,
             Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
             ECDSACircuit<Fr>,
-        >(&params, &pk, &[proof_circuit], &[&[]], &mut rng, &mut transcript)?;
+        >(
+            &params,
+            &pk,
+            &[proof_circuit],
+            &[&[]],
+            &mut rng,
+            &mut transcript,
+        )?;
         let proof = transcript.finalize();
         end_timer!(proof_time);
 
@@ -590,7 +673,13 @@ fn bench_secp256r1_ecdsa() -> Result<(), Box<dyn std::error::Error>> {
             Challenge255<G1Affine>,
             Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
             SingleStrategy<'_, Bn256>,
-        >(verifier_params, pk.get_vk(), strategy, &[&[]], &mut transcript)
+        >(
+            verifier_params,
+            pk.get_vk(),
+            strategy,
+            &[&[]],
+            &mut transcript
+        )
         .is_ok());
         end_timer!(verify_time);
         fs::remove_file(var("ECDSA_CONFIG").unwrap())?;
